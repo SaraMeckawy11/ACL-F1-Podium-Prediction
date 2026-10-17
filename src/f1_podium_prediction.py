@@ -592,6 +592,25 @@ savefig(fig, "q1_front_row_conversion", "Q1: front-row-to-podium conversion per 
         "2014 hybrid era, by grid and by qualifying definition.")
 
 # %% [markdown]
+# **Answer — Q1.** From 1994–2013, **64.4%** of front-row starts (grid P1–P2) ended on the podium; from
+# 2014–2024 this rose to **76.0%**. Suzuka is first in both periods (75.0% → 88.9%). Since 2014 the top five are
+# Suzuka, Yas Marina, Monaco, Spa-Francorchamps and Barcelona; before 2014 they were Suzuka, Hungaroring, Bahrain,
+# Hockenheimring and Imola. **The ranking changes a lot with the hybrid era:** across the 17 circuits with at least
+# 8 front-row starts in both periods, the Spearman rank correlation is **ρ = −0.21 (p = 0.414)**, so a circuit's
+# pre-2014 rank says almost nothing about its hybrid-era rank. **Grid vs qualifying:** 38 drivers qualified on the
+# front row but started further back because of penalties; only **28.9%** of them reached the podium, which is why
+# we use the grid (actual start) as the main definition and show the qualifying definition next to it.
+#
+# * **Grain:** one row per driver per race start (results → races → circuits, plus qualifying for the
+#   qualifying-based definition).
+# * **Missingness:** qualifying data covers most rows only from 1994, so both periods start in 1994. Circuits with
+#   fewer than 8 front-row starts in a period are left out because the rates would be too noisy.
+# * **Pre-race cutoff:** grid and qualifying position are both fixed before the start, so both definitions use
+#   only pre-race information.
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+
+# %% [markdown]
 # ### Q2. Do drivers podium more often at home, after controlling for starting position?
 #
 # * Home race = the circuit's country equals the country of the driver's nationality (mapping below; nationalities
@@ -682,6 +701,22 @@ savefig(fig, "q2_home_advantage", "Q2: podium rate at home vs away inside each g
         "Mantel-Haenszel odds ratio; right: whether home drivers start further forward.")
 
 # %% [markdown]
+# **Answer — Q2. No detectable home advantage.** Without any control, home drivers look *worse*: podium rate
+# **11.6% at home vs 13.8% away** (crude odds ratio 0.82). Part of this is the start position: home drivers start
+# further back on average (grid 12.7 vs 11.7), so the crude comparison is unfair. After comparing drivers inside the same grid band (P1, P2–3, P4–6, P7–10, P11+), the pooled
+# **Mantel–Haenszel odds ratio is 0.91 (95% CI 0.76–1.08, p = 0.302)**. The interval includes 1, so once
+# starting position is controlled for, racing at home neither raises nor lowers the podium chance in a way we can
+# detect.
+#
+# * **Grain:** one row per driver per race start (24,549 starts, 1,932 at home); results → races → circuits
+#   (country) and results → drivers (nationality).
+# * **Missingness:** every nationality was mapped (no unmapped nationalities). Drivers whose country has no
+#   circuit can never be "home". The Indianapolis 500 is excluded.
+# * **Pre-race cutoff:** grid, nationality and circuit country are all known before the start.
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+
+# %% [markdown]
 # ### Q3. Which constructors have the highest mechanical-retirement rate in 2014–2021 vs 2022–2024?
 #
 # **Definition.** Rate = mechanical retirements / race starts of the constructor in the period. A mechanical
@@ -764,6 +799,29 @@ fig.suptitle("Q3 — mechanical-retirement rate by constructor (95% Wilson CI)",
 fig.tight_layout()
 savefig(fig, "q3_mechanical_retirements", "Q3: mechanical-retirement rate per constructor, hybrid era vs "
         "ground-effect era, and the overall mix of race outcomes.")
+
+# %% [markdown]
+# **Answer — Q3.** The overall mechanical-retirement rate fell from **9.7% of starts in 2014–2021** to
+# **6.1% in 2022–2024**. Highest rates:
+#
+# | period | 1st | 2nd | 3rd |
+# |---|---|---|---|
+# | 2014–2021 | Caterham 23.5% (34 starts) | Lotus F1 18.7% (75) | Toro Rosso 16.1% (242) |
+# | 2022–2024 | Alfa Romeo 12.5% (88) | Alpine F1 Team 11.0% (136) | AlphaTauri 8.0% (88) |
+#
+# The Wilson 95% intervals are wide for teams with few starts (Caterham has only 34), so the exact order is
+# uncertain; the drop between the two periods is the more solid finding.
+#
+# * **Grain:** one row per driver per race start; results → status → races (year) → constructors. Constructor
+#   identity follows `constructorId`, so renamed teams (Toro Rosso → AlphaTauri → RB) are counted separately.
+# * **Missingness:** every start has a status. The status → category mapping is ours and is saved in
+#   `tables/q3_status_mapping.csv`. **Limitation:** the generic status "Retired" (50 starts) is counted as
+#   non-mechanical, and "Wheel", "Front wing", "Rear wing" and "Undertray" are counted as mechanical although some
+#   of them may come from contact or pit stops, so the rates are approximate.
+# * **Pre-race cutoff:** not relevant for this descriptive question; status is post-race information and is never
+#   used as a feature for the current race (only shifted to past races in `mech_dnf_last10`).
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
 
 # %% [markdown]
 # ## 5. Feature engineering (leakage-safe) and feature selection
@@ -1189,6 +1247,16 @@ savefig(fig, "preprocessing_order", "Pre-processing order: a gap between validat
 order_exp.round(3)
 
 # %% [markdown]
+# **Result of the pre-processing-order experiments.** E1: fitting the imputer/scaler on all rows gives almost the
+# same scores here (val PR-AUC 0.725 both ways), but it is still wrong in principle, so we fit on training rows only.
+# E2 shows real leakage: oversampling *before* the split copies podium rows into the validation set and inflates
+# validation PR-AUC to **0.869**, while the honest version gives **0.553**; on the untouched test seasons both
+# are about 0.71, so the 0.869 is fake. E3: the order of imputation and scaling makes no real difference
+# (0.725 vs 0.724).
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+
+# %% [markdown]
 # ## 8. Predictive modelling
 #
 # **Metrics.** ROC-AUC, PR-AUC, F1, precision, recall, plus *top-3 hit rate* (in each race, mark the three highest
@@ -1358,6 +1426,23 @@ fig.tight_layout()
 savefig(fig, "confusion_and_mlp", "Confusion matrices on the test seasons and the MLP training curve.")
 
 # %% [markdown]
+# **Model choice vs the baseline.** The random forest (no depth limit, at least 25 rows per leaf, threshold 0.735)
+# has the highest validation PR-AUC (0.734) and is selected by our rule. It is clearly better than the simple
+# "first three on the grid" rule (test PR-AUC 0.710 vs 0.647; test top-3 hit 66.7% vs 65.2%). **But it does not
+# clearly beat the logistic-regression baseline:** the baseline scores 0.726 on validation and is slightly better on
+# test (PR-AUC 0.715, F1 0.677 vs 0.710 and 0.673). With only 779 validation rows these differences are within
+# noise. The shallow MLP ties the forest on validation (0.734) and the two-layer version (64, 32) is worse than the
+# one-layer version (32), so more depth did not help. Gradient boosting is the weakest model here (val PR-AUC
+# 0.671) and its top-3 hit rate is even below the grid rule. **Conclusion:** most of the predictive signal is
+# captured by a linear model on well-built pre-race features; the extra complexity adds little.
+#
+# Train PR-AUC is lower than validation PR-AUC for the linear model and the MLP (0.614 vs 0.726). This is not
+# leakage: the validation seasons are simply easier to predict. Even the plain grid rule scores PR-AUC 0.539 on the
+# training seasons (1980–2019) but 0.639 on 2020–2021, so the gap comes from the seasons, not from the model.
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+
+# %% [markdown]
 # **How the models work and their limitations**
 #
 # | model | how it works | limitations here |
@@ -1406,6 +1491,16 @@ ablation[["model", "removed group", "n features", "val PR-AUC", "Δ val PR-AUC",
           "val F1", "test F1"]].round(4)
 
 # %% [markdown]
+# **Ablation — interpretation.** For the random forest, removing the **grid** group gives the largest drop on the
+# test seasons (PR-AUC −0.033, F1 0.673 → 0.621), and removing **qualifying** gives the largest drop on validation
+# (−0.024). Removing driver form (−0.019) and standings (−0.011) also hurts on validation. Removing constructor form
+# (+0.002) or context (−0.002) changes almost nothing, because their information is already carried by standings and
+# driver form. For the logistic-regression baseline, the grid group matters most on both validation (−0.018) and
+# test (−0.025). So starting position is the group the models cannot do without.
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+
+# %% [markdown]
 # ## 10. Explainability (XAI)
 #
 # > **Not causal.** Importance and SHAP values describe *what the model relies on* to make predictions, not what
@@ -1429,6 +1524,16 @@ ax.set_title(f"Permutation importance — {BEST_NAME}")
 savefig(fig, "xai_permutation_importance", "Permutation importance on the validation seasons.")
 REPORT["pi_top"] = pi_df.head(5).feature.tolist()
 pi_df.round(4)
+
+# %% [markdown]
+# **Permutation importance — interpretation.** Shuffling `grid_pos` lowers validation PR-AUC by **0.086**, far more
+# than any other feature. Next come `quali_gap_pct` (0.017), `quali_pos` (0.012), `drv_grid_pct_last5` (0.012) and
+# `con_pts_share` (0.009). Apart from `grid_pos`, the error bars are as large as the values (only 779 validation
+# rows), so the order below the top feature should not be over-read. Correlated features share importance: grid and
+# qualifying position carry similar information, so shuffling one of them costs little while the other is still
+# there (`front_row` even comes out slightly negative).
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
 
 # %% [markdown]
 # ### 10.2 Global: SHAP
@@ -1471,6 +1576,20 @@ if HAS_SHAP:
                 "interaction.")
 else:
     print("SHAP is not installed — run `pip install shap` to produce these plots.")
+
+# %% [markdown]
+# **SHAP — interpretation.** SHAP agrees that **`grid_pos` dominates** (mean |SHAP| ≈ 0.09, about three times the
+# next feature). The dependence plot shows the shape: starting P1–P3 adds about +0.2 to the podium probability,
+# the effect falls steeply between P4 and P10, and from P10 back it is flat at about −0.06. Next are
+# `drv_grid_pct_last5` (where the driver usually started in the last 5 races), then team form
+# (`con_podium_rate_last5`, `con_pts_share`) and `quali_pos`. In the beeswarm, low grid and high team form push
+# predictions up, as expected. The model therefore relies mostly on **where the car starts and how strong the car
+# has been recently**.
+#
+# **Not causal.** These values describe what the model *relies on*, not what *causes* a podium. A fast car causes
+# both a good grid slot and a podium; the grid slot itself is a signal of car pace, not the reason for the result.
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
 
 # %% [markdown]
 # ### 10.3 Local explanations: one correct podium call and one false alarm (test seasons)
@@ -1518,6 +1637,17 @@ if HAS_LIME:
         savefig(fig, f"xai_lime_{label.replace(' ', '_')}", f"LIME explanation for one {label} prediction.")
 else:
     print("LIME is not installed — local explanation shown with SHAP only (`pip install lime` to add it).")
+
+# %% [markdown]
+# **Local explanations — interpretation.** Both examples are Max Verstappen starting from pole with p(podium) =
+# 0.98. In the **true positive** (2023 Dutch GP) and the **false alarm** (2024 Australian GP) the SHAP waterfalls
+# and LIME bars look almost the same: grid P1 (about +0.19 in SHAP), strong recent grid positions, front row and
+# qualifying P1 push the prediction up, and no feature pushes it down. This shows a key limitation: the model only
+# sees pre-race information, so it cannot foresee race events such as a retirement. A confident wrong prediction for
+# a pole sitter is expected from time to time and is not a sign of a bug. LIME and local SHAP agree on the top
+# features, which gives us more trust in the explanation.
+#
+# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
 
 # %% [markdown]
 # ## 11. Inference function
