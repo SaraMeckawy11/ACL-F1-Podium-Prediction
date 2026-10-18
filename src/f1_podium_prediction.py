@@ -40,6 +40,8 @@ import time
 import warnings
 from pathlib import Path
 
+from IPython.display import Markdown, display
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -56,6 +58,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.contingency_tables import StratifiedTable
+from statsmodels.stats.proportion import proportion_confint
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -88,6 +92,7 @@ for d in (FIG_DIR, TAB_DIR, REPORT_DIR):
 
 FIGURES = {}   # name -> (path, caption); collected for the report
 REPORT = {}    # key -> value / text; collected for the report
+INTERP = {}    # section -> interpretation text (markdown), generated from this run's numbers
 
 
 def savefig(fig, name, caption=""):
@@ -335,6 +340,25 @@ dtype_cmp = pd.DataFrame({
 dtype_cmp
 
 # %% [markdown]
+# **Plausibility check of qualifying lap times.** Typing can only check the *format* of a time, not whether the value
+# makes sense. We compare each driver's best qualifying lap with the median best lap of the same session. Real slow
+# laps (rain, a car problem) stay within about 1.5× the median, so a lap more than **2× the session median** cannot be
+# a real flying lap and is treated as a recording error (set to missing; the imputer handles it later).
+
+# %%
+QUALI_MAX_RATIO = 2.0
+ql_times = clean["qualifying"][["q1", "q2", "q3"]]
+ratio_to_median = ql_times.div(ql_times.min(axis=1).groupby(clean["qualifying"].raceId).transform("median"), axis=0)
+bad_laps = ratio_to_median > QUALI_MAX_RATIO
+top2 = ratio_to_median.stack().dropna().nlargest(2)
+print(f"Largest lap / session-median ratio: {top2.iloc[0]:.2f}; second largest: {top2.iloc[1]:.2f}")
+bad_rows = clean["qualifying"][bad_laps.any(axis=1)].merge(clean["races"][["raceId", "year", "name"]], on="raceId")
+cleaning_log = [{"step": f"qualifying lap > {QUALI_MAX_RATIO}x session median -> missing", "table": "qualifying",
+                 "rows removed": 0, "values set to missing": int(bad_laps.sum().sum())}]
+clean["qualifying"][["q1", "q2", "q3"]] = ql_times.mask(bad_laps)
+bad_rows[["year", "name", "driverId", "q1", "q2", "q3"]]
+
+# %% [markdown]
 # ### 2.2 Primary and foreign keys
 # Primary keys must be unique and non-null; every foreign key must exist in the table it points to.
 # Raw CSVs are never modified: orphan rows (if any) are dropped from the *clean copies* only and logged.
@@ -371,7 +395,7 @@ FK = [("results", "raceId", "races"), ("results", "driverId", "drivers"), ("resu
       ("sprint_results", "raceId", "races"), ("sprint_results", "driverId", "drivers"),
       ("sprint_results", "constructorId", "constructors"), ("sprint_results", "statusId", "status"),
       ("races", "circuitId", "circuits"), ("races", "year", "seasons")]
-fk_rows, cleaning_log = [], []
+fk_rows = []
 for child, col, parent in FK:
     if child not in clean or parent not in clean:
         continue
@@ -522,13 +546,6 @@ dq = (base.merge(clean["circuits"][["circuitId", "name", "country"]].rename(colu
              on="constructorId", how="left"))
 
 
-def wilson(k, n, z=1.96):
-    p = k / n
-    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
-    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
-    return centre - half, centre + half
-
-
 # %% [markdown]
 # ### Q1. Which circuits convert a front-row start into a podium most often, and does the ranking change with the
 # 2014 hybrid era?
@@ -607,8 +624,6 @@ savefig(fig, "q1_front_row_conversion", "Q1: front-row-to-podium conversion per 
 #   fewer than 8 front-row starts in a period are left out because the rates would be too noisy.
 # * **Pre-race cutoff:** grid and qualifying position are both fixed before the start, so both definitions use
 #   only pre-race information.
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
 
 # %% [markdown]
 # ### Q2. Do drivers podium more often at home, after controlling for starting position?
@@ -617,7 +632,9 @@ savefig(fig, "q1_front_row_conversion", "Q1: front-row-to-podium conversion per 
 #   without a matching circuit country are never "home").
 # * Population: race starts (grid > 0), Indianapolis 500 excluded (section 2.4).
 # * Control: stratify by grid band (1, 2–3, 4–6, 7–10, 11+) and pool the strata with the **Cochran–Mantel–Haenszel**
-#   odds ratio (home vs away within the same grid band) and its 95% CI.
+#   odds ratio (home vs away within the same grid band) and its 95% CI, computed with `statsmodels`
+#   (`StratifiedTable`). Idea in one sentence: compare home and away drivers *only inside the same grid band*, then
+#   average those per-band odds ratios, so a difference in starting position cannot explain the result.
 
 # %%
 NAT_TO_COUNTRY = {
@@ -649,28 +666,20 @@ q2["grid_band"] = pd.cut(q2.grid, [0, 1, 3, 6, 10, 100], labels=["P1", "P2-3", "
 
 
 def mantel_haenszel(df, strata="grid_band", exposure="home", outcome="podium"):
-    rows, R, S = [], [], []
-    num_chi, var_chi, PR, PS_QR, QS = 0, 0, 0, 0, 0
+    """One 2x2 table (home/away x podium/no podium) per grid band, pooled with statsmodels' StratifiedTable."""
+    rows, tables = [], []
     for k, g in df.groupby(strata, observed=True):
-        a = int(((g[exposure]) & (g[outcome] == 1)).sum()); b = int(((g[exposure]) & (g[outcome] == 0)).sum())
-        c = int(((~g[exposure]) & (g[outcome] == 1)).sum()); d = int(((~g[exposure]) & (g[outcome] == 0)).sum())
-        n = a + b + c + d
-        if n < 2 or (a + b) == 0 or (c + d) == 0:
+        t = pd.crosstab(g[exposure], g[outcome]).reindex(index=[True, False], columns=[1, 0], fill_value=0)
+        (a, b), (c, d) = t.to_numpy()          # a = home podium, b = home no podium, c = away podium, d = away no
+        if (a + b) == 0 or (c + d) == 0:
             continue
-        Ri, Si = a * d / n, b * c / n
-        Pi, Qi = (a + d) / n, (b + c) / n
-        R.append(Ri); S.append(Si)
-        PR += Pi * Ri; PS_QR += Pi * Si + Qi * Ri; QS += Qi * Si
-        num_chi += a - (a + b) * (a + c) / n
-        var_chi += (a + b) * (c + d) * (a + c) * (b + d) / (n * n * (n - 1))
+        tables.append(t.to_numpy())
         rows.append({"grid band": k, "home starts": a + b, "home podium %": 100 * a / (a + b),
                      "away starts": c + d, "away podium %": 100 * c / (c + d),
                      "stratum OR": (a * d) / (b * c) if b * c else np.nan})
-    sR, sS = sum(R), sum(S)
-    or_mh = sR / sS
-    se = np.sqrt(PR / (2 * sR ** 2) + PS_QR / (2 * sR * sS) + QS / (2 * sS ** 2))
-    chi2 = (abs(num_chi) - 0.5) ** 2 / var_chi
-    return pd.DataFrame(rows), or_mh, (or_mh * np.exp(-1.96 * se), or_mh * np.exp(1.96 * se)), stats.chi2.sf(chi2, 1)
+    st = StratifiedTable(tables)
+    return (pd.DataFrame(rows), st.oddsratio_pooled, st.oddsratio_pooled_confint(),
+            st.test_null_odds(correction=True).pvalue)
 
 
 q2_strata, or_mh, or_ci, p_mh = mantel_haenszel(q2)
@@ -713,8 +722,6 @@ savefig(fig, "q2_home_advantage", "Q2: podium rate at home vs away inside each g
 # * **Missingness:** every nationality was mapped (no unmapped nationalities). Drivers whose country has no
 #   circuit can never be "home". The Indianapolis 500 is excluded.
 # * **Pre-race cutoff:** grid, nationality and circuit country are all known before the start.
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
 
 # %% [markdown]
 # ### Q3. Which constructors have the highest mechanical-retirement rate in 2014–2021 vs 2022–2024?
@@ -772,7 +779,7 @@ MIN_STARTS = 20
 q3t = (q3.groupby(["period", "constructor"]).agg(starts=("mech", "size"), mech=("mech", "sum")).reset_index()
        .query("starts >= @MIN_STARTS"))
 q3t["rate"] = q3t.mech / q3t.starts
-q3t[["ci_low", "ci_high"]] = np.array([wilson(k, n) for k, n in zip(q3t.mech, q3t.starts)])
+q3t["ci_low"], q3t["ci_high"] = proportion_confint(q3t.mech, q3t.starts, alpha=0.05, method="wilson")
 q3t = q3t.sort_values(["period", "rate"], ascending=[True, False])
 savetable(q3t, "q3_mechanical_retirement_rates")
 REPORT["q3_overall"] = q3.groupby("period").mech.mean().to_dict()
@@ -820,8 +827,6 @@ savefig(fig, "q3_mechanical_retirements", "Q3: mechanical-retirement rate per co
 #   of them may come from contact or pit stops, so the rates are approximate.
 # * **Pre-race cutoff:** not relevant for this descriptive question; status is post-race information and is never
 #   used as a feature for the current race (only shifted to past races in `mech_dnf_last10`).
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
 
 # %% [markdown]
 # ## 5. Feature engineering (leakage-safe) and feature selection
@@ -857,12 +862,16 @@ df = base.copy().sort_values(["date", "raceId", "driverId"]).reset_index(drop=Tr
 df["field_size"] = df.groupby("raceId").driverId.transform("size")
 df["status_group"] = df.status.map(status_group)
 df["mech_dnf"] = (df.status_group == "mechanical").astype(int)
-df["finish_pct"] = (df.positionOrder - 1) / (df.field_size - 1).clip(lower=1)   # 0 = winner, 1 = last (post-race,
-#                                                                                    only used shifted)
+# positionOrder and grid count every entrant, including the non-starters removed in 2.4, so they can be larger than
+# field_size. Percentiles are therefore built from the rank *among the starters of this race*, which keeps them in [0, 1].
+finish_rank = df.groupby("raceId").positionOrder.rank(method="first")
+df["finish_pct"] = (finish_rank - 1) / (df.field_size - 1).clip(lower=1)   # 0 = winner, 1 = last (post-race,
+#                                                                            only used shifted)
 # --- grid group
 df["pit_lane_start"] = (df.grid.fillna(0) == 0).astype(int)
 df["grid_pos"] = df.grid.where(df.grid > 0, df.field_size).astype(float)   # pit lane -> back of the field
-df["grid_pct"] = (df.grid_pos - 1) / (df.field_size - 1).clip(lower=1)
+grid_rank = df.groupby("raceId").grid_pos.rank(method="min")
+df["grid_pct"] = (grid_rank - 1) / (df.field_size - 1).clip(lower=1)
 df["front_row"] = (df.grid_pos <= 2).astype(int)
 
 # --- qualifying group
@@ -952,6 +961,8 @@ FEATURE_GROUPS = {
 ALL_FEATURES = [f for g in FEATURE_GROUPS.values() for f in g]
 df = df.sort_values(["date", "raceId", "driverId"]).reset_index(drop=True)
 assert not df.duplicated(["raceId", "driverId"]).any(), "grain broken"
+pct_cols = ["finish_pct", "grid_pct", "drv_finish_pct_last5", "drv_grid_pct_last5", "con_finish_pct_last5"]
+assert (df[pct_cols].min() >= 0).all() and (df[pct_cols].max() <= 1).all(), "a percentile feature is outside [0, 1]"
 print(f"Modelling table: {len(df):,} rows × {len(ALL_FEATURES)} candidate features; podium rate {df.podium.mean():.1%}")
 df[["year", "raceId", "driverId", "podium"] + ALL_FEATURES].sample(5, random_state=SEED)
 
@@ -1246,15 +1257,26 @@ savefig(fig, "preprocessing_order", "Pre-processing order: a gap between validat
         "an optimistic (leaky) validation estimate.")
 order_exp.round(3)
 
-# %% [markdown]
-# **Result of the pre-processing-order experiments.** E1: fitting the imputer/scaler on all rows gives almost the
-# same scores here (val PR-AUC 0.725 both ways), but it is still wrong in principle, so we fit on training rows only.
-# E2 shows real leakage: oversampling *before* the split copies podium rows into the validation set and inflates
-# validation PR-AUC to **0.869**, while the honest version gives **0.553**; on the untouched test seasons both
-# are about 0.71, so the 0.869 is fake. E3: the order of imputation and scaling makes no real difference
-# (0.725 vs 0.724).
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+# %%
+# Interpretation text is generated from the numbers above, so it always matches this run.
+e, et = order_exp["val PR-AUC"], order_exp["test PR-AUC"]
+E1a, E1b = "E1 fit pre-processing on TRAIN only", "E1 fit pre-processing on ALL data first"
+E2a, E2b = "E2 oversample BEFORE split", "E2 split, then oversample train only"
+E3a, E3b = "E3 impute → scale", "E3 scale → impute"
+e2_fake = e[E2a] - e[E2b] > 0.05 and abs(et[E2a] - et[E2b]) < 0.03
+INTERP["preprocessing"] = f"""**Result of the pre-processing-order experiments.**
+
+- **E1** (where the imputer/scaler is fitted): validation PR-AUC {e[E1a]:.3f} when fitted on the training rows vs
+  {e[E1b]:.3f} when fitted on all rows. The difference is tiny here, but fitting on all rows is still wrong in principle
+  (validation and test statistics would enter the training step), so we fit on training rows only.
+- **E2** (oversampling before vs after the split): oversampling *before* the split copies the same podium rows into
+  the validation part and gives validation PR-AUC **{e[E2a]:.3f}**, while the honest version gives **{e[E2b]:.3f}**.
+  On the untouched test seasons they score {et[E2a]:.3f} and {et[E2b]:.3f}
+  {'— the high validation score does not carry over, so it is fake: this is real leakage' if e2_fake else ''}.
+  (E2 validates on a random 20% of the training seasons, so its validation numbers are not comparable with E1/E3.)
+- **E3** (impute → scale vs scale → impute): {e[E3a]:.3f} vs {e[E3b]:.3f}, so the order makes no real difference for
+  median imputation and standardisation."""
+display(Markdown(INTERP["preprocessing"]))
 
 # %% [markdown]
 # ## 8. Predictive modelling
@@ -1378,6 +1400,28 @@ comparison_wide = comparison.pivot(index="model", columns="split",
 comparison_wide = comparison_wide.reindex(columns=["train", "validation", "test"], level=1)
 comparison_wide.round(3)
 
+# %% [markdown]
+# **Is the gap between the selected model and the baseline real?** The validation set is small (two seasons), so we
+# resample its *races* with replacement 1,000 times (a bootstrap; whole races are kept together because the drivers
+# of one race are not independent) and recompute the PR-AUC difference each time. If the 95% interval of the
+# difference contains 0, the two models cannot be told apart on this data.
+
+# %%
+BASELINE_NAME = "Logistic regression (baseline)"
+rng_boot = np.random.default_rng(SEED)
+val_rows_by_race = [np.flatnonzero(val.raceId.to_numpy() == r) for r in val.raceId.unique()]
+p_sel, p_base = probs[(BEST_NAME, "validation")], probs[(BASELINE_NAME, "validation")]
+boot_diff = []
+for _ in range(1000):
+    pick = rng_boot.integers(0, len(val_rows_by_race), len(val_rows_by_race))
+    idx = np.concatenate([val_rows_by_race[i] for i in pick])
+    boot_diff.append(average_precision_score(yva[idx], p_sel[idx]) - average_precision_score(yva[idx], p_base[idx]))
+boot_ci = np.percentile(boot_diff, [2.5, 97.5])
+REPORT["boot_diff"] = float(average_precision_score(yva, p_sel) - average_precision_score(yva, p_base))
+REPORT["boot_ci"] = boot_ci.tolist()
+print(f"Validation PR-AUC difference, {BEST_NAME} − baseline: {REPORT['boot_diff']:+.3f} "
+      f"(95% bootstrap CI {boot_ci[0]:+.3f} to {boot_ci[1]:+.3f}, {len(val_rows_by_race)} races)")
+
 # %%
 fig, axes = plt.subplots(2, 2, figsize=(15, 11))
 for col, split_name, y in [(0, "validation", yva), (1, "test", yte)]:
@@ -1425,22 +1469,44 @@ fig.legend(loc="lower right", fontsize=8)
 fig.tight_layout()
 savefig(fig, "confusion_and_mlp", "Confusion matrices on the test seasons and the MLP training curve.")
 
-# %% [markdown]
-# **Model choice vs the baseline.** The random forest (no depth limit, at least 25 rows per leaf, threshold 0.735)
-# has the highest validation PR-AUC (0.734) and is selected by our rule. It is clearly better than the simple
-# "first three on the grid" rule (test PR-AUC 0.710 vs 0.647; test top-3 hit 66.7% vs 65.2%). **But it does not
-# clearly beat the logistic-regression baseline:** the baseline scores 0.726 on validation and is slightly better on
-# test (PR-AUC 0.715, F1 0.677 vs 0.710 and 0.673). With only 779 validation rows these differences are within
-# noise. The shallow MLP ties the forest on validation (0.734) and the two-layer version (64, 32) is worse than the
-# one-layer version (32), so more depth did not help. Gradient boosting is the weakest model here (val PR-AUC
-# 0.671) and its top-3 hit rate is even below the grid rule. **Conclusion:** most of the predictive signal is
-# captured by a linear model on well-built pre-race features; the extra complexity adds little.
-#
-# Train PR-AUC is lower than validation PR-AUC for the linear model and the MLP (0.614 vs 0.726). This is not
-# leakage: the validation seasons are simply easier to predict. Even the plain grid rule scores PR-AUC 0.539 on the
-# training seasons (1980–2019) but 0.639 on 2020–2021, so the gap comes from the seasons, not from the model.
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+# %%
+def score(model, split, metric):
+    return comparison[(comparison.model == model) & (comparison.split == split)][metric].iloc[0]
+
+
+val_pr = {m: score(m, "validation", "PR-AUC") for m in best}
+models_by_val = sorted(val_pr, key=val_pr.get, reverse=True)
+grid_t = lambda metric: score("Grid rule (reference)", "test", metric)
+sel_t = lambda metric: score(BEST_NAME, "test", metric)
+same_as_baseline = BEST_NAME == BASELINE_NAME or REPORT["boot_ci"][0] <= 0 <= REPORT["boot_ci"][1]
+mlp_trials = trials[trials.model == "Shallow NN (MLP)"].assign(two_layers=lambda t: t.params.str.contains(r"\(\d+, \d+\)"))
+mlp_1, mlp_2 = (mlp_trials.loc[mlp_trials.two_layers == k, "val PR-AUC"].max() for k in (False, True))
+worst = models_by_val[-1]
+thr_lo, thr_hi = min(THRESHOLDS.values()), max(THRESHOLDS.values())
+INTERP["models"] = f"""**Model choice vs the baseline.**
+
+- Validation PR-AUC (primary metric): {', '.join(f'{m} {val_pr[m]:.3f}' for m in models_by_val)}. Our rule selects
+  the model with the highest validation PR-AUC: **{BEST_NAME}** {best[BEST_NAME]['params']}, threshold {BEST_THR:.3f}.
+- Against the "first three on the grid" rule on test: {'; '.join(f"{k} {sel_t(k):.3f} vs {grid_t(k):.3f} ({'better' if sel_t(k) > grid_t(k) else 'worse'})" for k in ['PR-AUC', 'F1', 'Top-3 hit'])}.
+  {'The model ranks drivers better overall (PR-AUC), even where it does not beat the grid rule on every metric.' if sel_t('PR-AUC') > grid_t('PR-AUC') else ''}
+- Against the logistic-regression baseline (validation {score(BASELINE_NAME, 'validation', 'PR-AUC'):.3f}, test
+  {score(BASELINE_NAME, 'test', 'PR-AUC'):.3f}): the race-level bootstrap gives a validation PR-AUC difference of
+  {REPORT['boot_diff']:+.3f} (95% CI {REPORT['boot_ci'][0]:+.3f} to {REPORT['boot_ci'][1]:+.3f}).
+  {'**The interval contains 0, so the two models cannot be told apart:** most of the signal is captured by a simple linear model on good pre-race features, and the extra complexity adds little.' if same_as_baseline else '**The interval excludes 0, so the selected model is reliably better than the baseline.**'}
+- Shallow network depth: best one-layer version {mlp_1:.3f}, best two-layer version {mlp_2:.3f} on validation, so
+  {'more depth did not help' if mlp_2 <= mlp_1 else 'the second layer helped a little'}.
+- The weakest model on validation is {worst} ({val_pr[worst]:.3f}).
+- Thresholds range from {thr_lo:.2f} to {thr_hi:.2f}: models trained with class weights (`balanced`) give higher
+  probabilities than models trained without them, so they need a higher cut-off. Every threshold is the F1-maximising
+  one on validation, never on test."""
+if score(BASELINE_NAME, "train", "PR-AUC") < score(BASELINE_NAME, "validation", "PR-AUC"):
+    INTERP["models"] += f"""
+- Training PR-AUC is lower than validation PR-AUC for the baseline ({score(BASELINE_NAME, 'train', 'PR-AUC'):.3f} vs
+  {score(BASELINE_NAME, 'validation', 'PR-AUC'):.3f}). This is not leakage: even the plain grid rule scores
+  {score('Grid rule (reference)', 'train', 'PR-AUC'):.3f} on the training seasons but
+  {score('Grid rule (reference)', 'validation', 'PR-AUC'):.3f} on {TRAIN_END + 1}–{VAL_END}, so those seasons are
+  simply easier to predict."""
+display(Markdown(INTERP["models"]))
 
 # %% [markdown]
 # **How the models work and their limitations**
@@ -1490,15 +1556,30 @@ savefig(fig, "ablation", "Feature-group ablation: negative = the group was contr
 ablation[["model", "removed group", "n features", "val PR-AUC", "Δ val PR-AUC", "test PR-AUC", "Δ test PR-AUC",
           "val F1", "test F1"]].round(4)
 
-# %% [markdown]
-# **Ablation — interpretation.** For the random forest, removing the **grid** group gives the largest drop on the
-# test seasons (PR-AUC −0.033, F1 0.673 → 0.621), and removing **qualifying** gives the largest drop on validation
-# (−0.024). Removing driver form (−0.019) and standings (−0.011) also hurts on validation. Removing constructor form
-# (+0.002) or context (−0.002) changes almost nothing, because their information is already carried by standings and
-# driver form. For the logistic-regression baseline, the grid group matters most on both validation (−0.018) and
-# test (−0.025). So starting position is the group the models cannot do without.
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+# %%
+abl = {m: g[~g["removed group"].str.startswith("—")].set_index("removed group") for m, g in ablation.groupby("model")}
+
+
+def ablation_text(model):
+    a = abl[model]
+    small = a.index[(a["Δ val PR-AUC"].abs() < 0.005) & (a["Δ test PR-AUC"].abs() < 0.005)].tolist()
+    gv, gt = a["Δ val PR-AUC"].idxmin(), a["Δ test PR-AUC"].idxmin()
+    if gv == gt:
+        main = (f"For the **{model}**, removing **{gv}** gives the largest drop on both validation "
+                f"({a.loc[gv, 'Δ val PR-AUC']:+.3f}) and test ({a.loc[gv, 'Δ test PR-AUC']:+.3f}).")
+    else:
+        main = (f"For the **{model}**, removing **{gv}** gives the largest drop on validation "
+                f"({a.loc[gv, 'Δ val PR-AUC']:+.3f}) and removing **{gt}** the largest drop on the test seasons "
+                f"({a.loc[gt, 'Δ test PR-AUC']:+.3f}).")
+    return (main
+            + (f" Removing {', '.join(small)} changes PR-AUC by less than ±0.005 on both splits: their information "
+               "is already carried by other groups." if small else ""))
+
+
+INTERP["ablation"] = ("**Ablation — interpretation.**\n\n- " + "\n- ".join(ablation_text(m) for m in abl)
+                      + "\n- Changes of a few thousandths are within noise (the validation set has only "
+                      f"{len(val)} rows).")
+display(Markdown(INTERP["ablation"]))
 
 # %% [markdown]
 # ## 10. Explainability (XAI)
@@ -1525,15 +1606,17 @@ savefig(fig, "xai_permutation_importance", "Permutation importance on the valida
 REPORT["pi_top"] = pi_df.head(5).feature.tolist()
 pi_df.round(4)
 
-# %% [markdown]
-# **Permutation importance — interpretation.** Shuffling `grid_pos` lowers validation PR-AUC by **0.086**, far more
-# than any other feature. Next come `quali_gap_pct` (0.017), `quali_pos` (0.012), `drv_grid_pct_last5` (0.012) and
-# `con_pts_share` (0.009). Apart from `grid_pos`, the error bars are as large as the values (only 779 validation
-# rows), so the order below the top feature should not be over-read. Correlated features share importance: grid and
-# qualifying position carry similar information, so shuffling one of them costs little while the other is still
-# there (`front_row` even comes out slightly negative).
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+# %%
+negative = pi_df.loc[pi_df["mean"] < 0, "feature"].tolist()
+noisy_share = (pi_df.iloc[1:]["std"] >= pi_df.iloc[1:]["mean"].abs()).mean()
+INTERP["permutation"] = f"""**Permutation importance — interpretation.** Shuffling `{pi_df.iloc[0].feature}` lowers
+validation PR-AUC by **{pi_df.iloc[0]['mean']:.3f}**, {pi_df.iloc[0]['mean'] / max(pi_df.iloc[1]['mean'], 1e-9):.1f}× the
+next feature. Next come {', '.join(f"`{r.feature}` ({r['mean']:.3f})" for _, r in pi_df.iloc[1:5].iterrows())}. For
+{noisy_share:.0%} of the features after the first, the error bar is as large as the value ({len(val)} validation rows),
+so the order below the top feature should not be over-read. Correlated features share importance: grid and qualifying
+position carry similar information, so shuffling one costs little while the other is still there
+{('(' + ', '.join(f'`{f}`' for f in negative) + ' even come out slightly negative)') if negative else ''}."""
+display(Markdown(INTERP["permutation"]))
 
 # %% [markdown]
 # ### 10.2 Global: SHAP
@@ -1577,19 +1660,23 @@ if HAS_SHAP:
 else:
     print("SHAP is not installed — run `pip install shap` to produce these plots.")
 
-# %% [markdown]
-# **SHAP — interpretation.** SHAP agrees that **`grid_pos` dominates** (mean |SHAP| ≈ 0.09, about three times the
-# next feature). The dependence plot shows the shape: starting P1–P3 adds about +0.2 to the podium probability,
-# the effect falls steeply between P4 and P10, and from P10 back it is flat at about −0.06. Next are
-# `drv_grid_pct_last5` (where the driver usually started in the last 5 races), then team form
-# (`con_podium_rate_last5`, `con_pts_share`) and `quali_pos`. In the beeswarm, low grid and high team form push
-# predictions up, as expected. The model therefore relies mostly on **where the car starts and how strong the car
-# has been recently**.
-#
-# **Not causal.** These values describe what the model *relies on*, not what *causes* a podium. A fast car causes
-# both a good grid slot and a podium; the grid slot itself is a signal of car pace, not the reason for the result.
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+# %%
+if shap_values is not None:
+    sv_df = pd.DataFrame(shap_values.values, columns=FEATURES)
+    x_df = pd.DataFrame(shap_values.data, columns=FEATURES)
+    direction = {f: stats.spearmanr(x_df[f], sv_df[f]).statistic for f in top_feat.index[:5]}
+    gp, sg = x_df["grid_pos"], sv_df["grid_pos"]
+    INTERP["shap"] = f"""**SHAP — interpretation.** `{top_feat.index[0]}` has the largest mean |SHAP|
+({top_feat.iloc[0]:.3f} {shap_units}, {top_feat.iloc[0] / top_feat.iloc[1]:.1f}× the next feature). The top five are
+{', '.join(f'`{f}`' for f in top_feat.index[:5])}. Direction (Spearman correlation between a feature's value and its
+SHAP value): {', '.join(f"`{f}` {'higher → more podium' if r > 0 else 'lower → more podium'}" for f, r in direction.items())}.
+The grid dependence plot shows the shape: starting P1–P3 adds on average {sg[gp <= 3].mean():+.3f}, P4–P10
+{sg[(gp >= 4) & (gp <= 10)].mean():+.3f} and behind P10 {sg[gp > 10].mean():+.3f} ({shap_units}). So the model relies
+mostly on **where the car starts and how strong the driver and car have been recently**.
+
+**Not causal.** These values describe what the model *relies on*, not what *causes* a podium. A fast car causes both a
+good grid slot and a podium; the grid slot itself is a signal of car pace, not the reason for the result."""
+    display(Markdown(INTERP["shap"]))
 
 # %% [markdown]
 # ### 10.3 Local explanations: one correct podium call and one false alarm (test seasons)
@@ -1607,11 +1694,13 @@ for label, i in local_cases.items():
     print(f"{label}: {rw.forename} {rw.surname}, {rw.year} {rw['name']} — p(podium)={rw.p:.2f}, "
           f"actual podium={bool(rw.podium)}, grid={rw.grid_pos:.0f}")
 
+local_shap, lime_lists = {}, {}
 if shap_values is not None:
     for label, i in local_cases.items():
         x_row = Xte.iloc[[i]] if isinstance(BEST_MODEL, HistGradientBoostingClassifier) \
             else Xte.iloc[[i]].fillna(Xtr.median())
         sv = explainer(x_row)
+        local_shap[label] = pd.Series(sv[0].values, index=FEATURES)
         shap.plots.waterfall(sv[0], max_display=12, show=False)
         fig = plt.gcf()
         fig.set_size_inches(9, 6)
@@ -1631,6 +1720,7 @@ if HAS_LIME:
                                     discretize_continuous=True, random_state=SEED)
     for label, i in local_cases.items():
         exp = lime_exp.explain_instance(Xte.iloc[i].fillna(med).to_numpy(), lime_predict, num_features=10)
+        lime_lists[label] = exp.as_list()
         fig = exp.as_pyplot_figure()
         fig.set_size_inches(9, 5)
         plt.title(f"LIME — {label} (p={p_test[i]:.2f})")
@@ -1638,16 +1728,37 @@ if HAS_LIME:
 else:
     print("LIME is not installed — local explanation shown with SHAP only (`pip install lime` to add it).")
 
-# %% [markdown]
-# **Local explanations — interpretation.** Both examples are Max Verstappen starting from pole with p(podium) =
-# 0.98. In the **true positive** (2023 Dutch GP) and the **false alarm** (2024 Australian GP) the SHAP waterfalls
-# and LIME bars look almost the same: grid P1 (about +0.19 in SHAP), strong recent grid positions, front row and
-# qualifying P1 push the prediction up, and no feature pushes it down. This shows a key limitation: the model only
-# sees pre-race information, so it cannot foresee race events such as a retirement. A confident wrong prediction for
-# a pole sitter is expected from time to time and is not a sign of a bug. LIME and local SHAP agree on the top
-# features, which gives us more trust in the explanation.
-#
-# *Numbers from the full Kaggle run (Version 1, 17 Oct 2026). Re-check them if the code or data change.*
+# %%
+def lime_feature(condition):
+    """'grid_pos <= 3.00' -> 'grid_pos' (longest name first, so similar names are not confused)."""
+    return next(f for f in sorted(FEATURES, key=len, reverse=True) if f in condition)
+
+
+lines, shared_counts = [], []
+for label, i in local_cases.items():
+    rw = tst_view.loc[i]
+    txt = (f"**{label}** — {rw.forename} {rw.surname}, {rw.year} {rw['name']}, grid {rw.grid_pos:.0f}, "
+           f"p(podium) = {rw.p:.2f}, actual: {'podium' if rw.podium else 'no podium'}.")
+    shap_top = local_shap[label].abs().nlargest(3).index if label in local_shap else []
+    lime_top = [lime_feature(c) for c, _ in lime_lists.get(label, [])[:3]]
+    if len(shap_top):
+        txt += " Local SHAP top 3: " + ", ".join(f"`{f}` ({local_shap[label][f]:+.3f})" for f in shap_top) + "."
+    if lime_top:
+        txt += " LIME top 3: " + ", ".join(f"`{f}`" for f in lime_top) + "."
+    if len(shap_top) and lime_top:
+        txt += f" Shared by both methods: {len(set(shap_top) & set(lime_top))} of 3."
+    lines.append(txt)
+    shared_counts.append(len(set(shap_top) & set(lime_top)) if len(shap_top) and lime_top else 3)
+if min(shared_counts) < 2:
+    lines.append("LIME and local SHAP agree only partly. LIME perturbs every feature independently over its whole "
+                 "training range, so rare 0/1 flags (e.g. `pit_lane_start`, `first_round`) get large, unrealistic "
+                 "changes and look important; SHAP compares the row with realistic background rows. We therefore "
+                 "trust SHAP more and read LIME as a rough check.")
+INTERP["local"] = ("**Local explanations — interpretation.**\n\n- " + "\n- ".join(lines)
+                   + "\n- The false alarm is a driver the model had every pre-race reason to rate highly. The model "
+                     "only sees pre-race information, so it cannot foresee a retirement or incident during the race; "
+                     "a confident wrong call like this is expected from time to time and is not a sign of a bug.")
+display(Markdown(INTERP["local"]))
 
 # %% [markdown]
 # ## 11. Inference function
@@ -1685,8 +1796,7 @@ REPORT["inference_partial"] = predict_podium(partial_record)
 # %% [markdown]
 # ## 12. Analytical report
 # Builds `outputs/report/report.html` (all figures embedded) and `report.md` from the numbers computed above.
-# Open the HTML in a browser and *Print → Save as PDF* for the submission. The team should still read it and add
-# its own interpretation where marked.
+# Open the HTML in a browser and *Print → Save as PDF* for the submission.
 
 # %%
 def fmt_pct(x):
@@ -1712,74 +1822,195 @@ FEATURE_DOCS = {
                         "10 — computed on the team's own time line, shift(1)",
     "context": "field size and home race — known from the entry list and calendar",
 }
+# Cover page. The logo is optional: put an image at F1_REPORT_LOGO (default report_logo.png) to show it.
+TEAM = [("Sara Meckawy", "68-38312"), ("Salma Meckawy", "68-38306")]
+KAGGLE_URL = "https://www.kaggle.com/code/sarameckawy/acl-f1-podium-prediction"
+GITHUB_URL = "https://github.com/SaraMeckawy11/ACL-F1-Podium-Prediction"
+LOGO = Path(os.environ.get("F1_REPORT_LOGO", "report_logo.png"))
+
+
+def box(*paragraphs, bullets=()):
+    """An 'Interpretation' box: paragraphs, then an optional bullet list (grain / missingness / cutoff)."""
+    body = "".join(f"<p>{p}</p>" for p in paragraphs)
+    if bullets:
+        body += "<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
+    return f'<div class="interp"><p class="lbl">Interpretation</p>{body}</div>'
+
+
+def md_to_html(text):
+    """Small markdown subset used by INTERP: paragraphs, '- ' bullets, **bold**, *italic*, `code`."""
+    def inline(t):
+        t = html.escape(" ".join(t.split()), quote=False)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+        return re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
+    out = []
+    for block in text.strip().split("\n\n"):
+        if block.lstrip().startswith("- "):
+            items = [b for b in ("\n" + block).split("\n- ") if b.strip()]
+            out.append("<ul>" + "".join(f"<li>{inline(b)}</li>" for b in items) + "</ul>")
+        else:
+            out.append(f"<p>{inline(block)}</p>")
+    return f'<div class="interp"><p class="lbl">Interpretation</p>{"".join(out)}</div>'
+
+
+# --- numbers used in the interpretations (all computed above, nothing typed by hand)
+pk_only = pk_audit[~pk_audit.table.str.contains("natural")]
+n_bad_laps = int(bad_laps.sum().sum())
+q1g = q1_tables["grid"]
+q1_top = q1g.index[0]
+q1_top_txt = (f"{q1_top} is first since 2014 ({fmt_pct(q1g.loc[q1_top, 'rate_1994–2013'])} → "
+              f"{fmt_pct(q1g.loc[q1_top, 'rate_2014–2024'])})"
+              + (" and was also first before 2014" if q1g.loc[q1_top, "rank_1994–2013"] == 1 else ""))
+q2_null = REPORT["q2_ci"][0] <= 1 <= REPORT["q2_ci"][1]
+retired_n = int(mapping_used.loc[mapping_used.status.str.lower() == "retired", "starts"].sum())
+ev_top = evidence.head(3)
+quali_missing_train = miss_of.get("quali_pos", np.nan)
+
+
 sections = [
     ("1. Data and cleaning", f"""
 Raw results rows: {len(raw['results']):,}. After foreign-key reconciliation ({REPORT['fk_orphans']} orphans), the grain
-fix ({REPORT['dup_pairs']} duplicated driver–race pairs from shared drives; rule: keep the car the driver started in,
-{REPORT['dup_rows_removed']} rows removed; {REPORT['dup_label_diff']} podium labels would differ under the
-best-finish rule) and the scope rules (Indianapolis 500 and non-starters excluded), the modelling table has
-{REPORT['n_rows_model_base']:,} rows, one per (raceId, driverId). All `\\N` sentinels were converted to missing values;
-dates, clock times and durations (lap, qualifying, pit-stop times → seconds) were typed and every conversion was
-checked for parse failures. Qualifying data covers most rows only from {REPORT['first_quali_year']}.""",
-     ["eda_raw_sentinels", "eda_raw_seasons", "eda_clean_impact", "eda_clean_distributions"]),
+fix ({REPORT['dup_pairs']} duplicated driver–race pairs, seasons {dups.year.min()}–{dups.year.max()}, from shared drives;
+rule: keep the car the driver started in, {REPORT['dup_rows_removed']} rows removed; {REPORT['dup_label_diff']} podium
+labels would differ under the best-finish rule) and the scope rules (Indianapolis 500 and non-starters excluded), the
+modelling table has {REPORT['n_rows_model_base']:,} rows, one per (raceId, driverId). All `\\N` sentinels were converted
+to missing values; dates, clock times and durations (lap, qualifying, pit-stop times → seconds) were typed and every
+conversion was checked for parse failures. Qualifying data covers most rows only from {REPORT['first_quali_year']}.""",
+     ["eda_raw_sentinels", "eda_raw_seasons", "eda_clean_impact", "eda_clean_distributions"],
+     box(f"""The raw CSVs were read as text and never changed; all cleaning happened on copies. The EDA showed that the
+<code>\\N</code> placeholder hides in {len(sentinels_before)} columns ({sentinels_before.n_sentinel.sum():,} cells) and
+turns numeric columns into text, so sentinel handling had to come before typing; after cleaning
+{remaining_sentinels} <code>\\N</code> are left and {int(parse_log['failed to parse'].sum())} values failed to parse.
+A plausibility check found {n_bad_laps} qualifying lap time(s) more than {QUALI_MAX_RATIO:g}× the median lap of the
+same session (a recording error, e.g. 16:42.640 instead of about 1:42 in the 1995 Japanese GP); they were set to
+missing. All {len(pk_only)} primary keys are unique and non-null, and all {len(fk_audit)} foreign-key checks found
+{REPORT['fk_orphans']} orphans. The only grain problem was {REPORT['dup_pairs']} duplicated (raceId, driverId) pairs.
+We keep the car the driver <i>started</i> in, because this choice uses only pre-race information (the grid); the
+best-finish alternative would use the race result to pick the row and would change {REPORT['dup_label_diff']} podium
+labels. Non-starters and the Indianapolis 500 were removed, giving {REPORT['n_rows_model_base']:,} rows. The EDA also
+showed that qualifying data is only complete from {REPORT['first_quali_year']}, which drives our feature and
+training-window choices.""")),
     ("2. Q1 — front-row conversion by circuit", f"""
 Overall front-row (grid) conversion: {', '.join(f'{k}: {fmt_pct(v)}' for k, v in REPORT['q1_overall'].items())}.
 Across the {REPORT['q1_n_circuits']} circuits with enough front-row starts in both periods, the Spearman rank
 correlation between the two periods is ρ = {REPORT['q1_rho']:.2f} (p = {REPORT['q1_p']:.3f}).
 Top-5 before 2014: {', '.join(REPORT['q1_top_pre'])}. Top-5 since 2014: {', '.join(REPORT['q1_top_post'])}.
 Qualifying vs grid: {REPORT['q1_penalised']} drivers qualified on the front row but started further back (penalties);
-they converted at {fmt_pct(REPORT['q1_pen_rate'])}. Grain: front-row starts (driver–race); missingness: the qualifying
-definition only uses 1994+ rows; cutoff: both grid and qualifying are pre-race.""", ["q1_front_row_conversion"]),
+they converted at {fmt_pct(REPORT['q1_pen_rate'])}.""", ["q1_front_row_conversion"],
+     box(f"""<b>Answer.</b> From 1994–2013, {fmt_pct(REPORT['q1_overall']['1994–2013'])} of front-row starts (grid P1–P2)
+ended on the podium; from 2014–2024 this {'rose' if REPORT['q1_overall']['2014–2024'] > REPORT['q1_overall']['1994–2013'] else 'fell'}
+to {fmt_pct(REPORT['q1_overall']['2014–2024'])}. {q1_top_txt}. Across the {REPORT['q1_n_circuits']} circuits with at least
+{MIN_FR} front-row starts in both periods, the Spearman rank correlation is ρ = {REPORT['q1_rho']:.2f}
+(p = {REPORT['q1_p']:.3f}), so {'a circuit&#x27;s pre-2014 rank says almost nothing about its hybrid-era rank: the ranking changes a lot' if REPORT['q1_p'] > 0.05 else 'the ranking is fairly stable across the two eras'}.
+Grid and qualifying differ: {REPORT['q1_penalised']} drivers qualified on the front row but started further back because
+of penalties, and only {fmt_pct(REPORT['q1_pen_rate'])} of them reached the podium. That is why the grid (the actual
+start) is our main definition.""",
+         bullets=["<b>Grain:</b> one row per driver per race start (results → races → circuits; qualifying for the "
+                  "qualifying-based definition).",
+                  f"<b>Missingness:</b> qualifying data covers most rows only from {REPORT['first_quali_year']}, so "
+                  f"both periods start in 1994; circuits with fewer than {MIN_FR} front-row starts in a period are "
+                  "left out.",
+                  "<b>Pre-race cutoff:</b> grid and qualifying position are both fixed before the start."])),
     ("3. Q2 — home advantage, controlling for grid", f"""
 Home starts: {REPORT['q2_n_home']:,} of {REPORT['q2_n']:,}. Crude podium rate home {fmt_pct(REPORT['q2_home_rate'])} vs
 away {fmt_pct(REPORT['q2_away_rate'])} (crude OR {REPORT['q2_or_crude']:.2f}); home drivers start on average from
 grid {REPORT['q2_home_grid']:.1f} vs {REPORT['q2_away_grid']:.1f}. Within grid bands, the Mantel–Haenszel odds ratio is
-{REPORT['q2_or_mh']:.2f} (95% CI {REPORT['q2_ci'][0]:.2f}–{REPORT['q2_ci'][1]:.2f}, p = {REPORT['q2_p']:.3g}).
-An OR whose CI includes 1 means no detectable home effect once starting position is accounted for.
-Grain: race starts; missingness: nationalities without a mapped country are never "home"; Indianapolis 500
-excluded.""", ["q2_home_advantage"]),
+{REPORT['q2_or_mh']:.2f} (95% CI {REPORT['q2_ci'][0]:.2f}–{REPORT['q2_ci'][1]:.2f}, p = {REPORT['q2_p']:.3g}).""",
+     ["q2_home_advantage"],
+     box(f"""<b>Answer: {'no detectable home advantage' if q2_null else 'a detectable home effect'}.</b> Without control,
+home drivers have a podium rate of {fmt_pct(REPORT['q2_home_rate'])} at home vs {fmt_pct(REPORT['q2_away_rate'])} away
+(crude OR {REPORT['q2_or_crude']:.2f}), but they also start from a different place on average (grid
+{REPORT['q2_home_grid']:.1f} vs {REPORT['q2_away_grid']:.1f}), so the crude comparison is unfair. Comparing drivers
+inside the same grid band (P1, P2–3, P4–6, P7–10, P11+), the pooled Mantel–Haenszel odds ratio is
+{REPORT['q2_or_mh']:.2f} (95% CI {REPORT['q2_ci'][0]:.2f}–{REPORT['q2_ci'][1]:.2f}, p = {REPORT['q2_p']:.3f}).
+{'The interval includes 1, so once starting position is controlled for, racing at home does not change the podium chance in a way we can detect.' if q2_null else 'The interval excludes 1, so the home effect remains after controlling for starting position.'}""",
+         bullets=[f"<b>Grain:</b> one row per driver per race start ({REPORT['q2_n']:,} starts, "
+                  f"{REPORT['q2_n_home']:,} at home); results → races → circuits (country) and results → drivers "
+                  "(nationality).",
+                  "<b>Missingness:</b> " + ("every nationality was mapped" if not unmapped else
+                                            f"unmapped nationalities: {', '.join(unmapped)}")
+                  + "; drivers whose country has no circuit are never \"home\"; the Indianapolis 500 is excluded.",
+                  "<b>Pre-race cutoff:</b> grid, nationality and circuit country are all known before the start."])),
     ("4. Q3 — mechanical retirements", f"""
 Overall mechanical-retirement rate per start: {', '.join(f'{k}: {fmt_pct(v)}' for k, v in REPORT['q3_overall'].items())}.
 Highest rates: {'; '.join(f"{p}: " + ', '.join(f'{c} {fmt_pct(r)} ({n} starts)' for c, r, n in v)
                           for p, v in REPORT['q3_top'].items())}.
 Mechanical = component failure (engine, gearbox, hydraulics, power unit, ERS, …); crashes, driver errors, punctures,
-pit-crew errors and regulation decisions are excluded (full mapping in `tables/q3_status_mapping.csv`).
-Constructor identity follows constructorId, so renamed teams (e.g. Toro Rosso → AlphaTauri → RB) appear
-separately.""", ["q3_mechanical_retirements"]),
+pit-crew errors and regulation decisions are excluded (full mapping in `tables/q3_status_mapping.csv`).""",
+     ["q3_mechanical_retirements"],
+     box(f"""<b>Answer.</b> The overall mechanical-retirement rate went from
+{fmt_pct(REPORT['q3_overall']['2014–2021'])} of starts (2014–2021) to {fmt_pct(REPORT['q3_overall']['2022–2024'])}
+(2022–2024). The highest rates were {', '.join(f'{c} ({fmt_pct(r)}, {n} starts)' for c, r, n in REPORT['q3_top']['2014–2021'])}
+in 2014–2021, and {', '.join(f'{c} ({fmt_pct(r)}, {n} starts)' for c, r, n in REPORT['q3_top']['2022–2024'])} in
+2022–2024 (teams with at least {MIN_STARTS} starts). The 95% Wilson intervals are wide for teams with few starts, so
+the exact order is uncertain; the change between the two periods is the more solid finding.""",
+         bullets=["<b>Grain:</b> one row per driver per race start; results → status → races (year) → constructors. "
+                  "Renamed teams (e.g. Toro Rosso → AlphaTauri → RB) are separate constructorIds.",
+                  f"<b>Missingness:</b> every start has a status. The status → category mapping is our own. The "
+                  f"generic status \"Retired\" ({retired_n} starts) is counted as non-mechanical, and \"Wheel\", "
+                  "\"Front wing\", \"Rear wing\" and \"Undertray\" as mechanical, although some of these may come "
+                  "from contact or pit stops, so the rates are approximate.",
+                  "<b>Pre-race cutoff:</b> not relevant for this descriptive question; status is post-race and is "
+                  "never a feature for the current race (only shifted to past races in the mechanical-DNF form "
+                  "features)."])),
     ("5. Features and why each is valid at the cutoff",
      "<ul>" + "".join(f"<li><b>{g}</b>: {html.escape(FEATURE_DOCS[g])}. Used: {', '.join(fs)}</li>"
                       for g, fs in GROUPS.items()) + "</ul>"
      + (f"<p>Dropped by the evidence rule: {html.escape('; '.join(f'{k} ({v})' for k, v in REPORT['dropped_features'].items()))}.</p>"
         if REPORT["dropped_features"] else "")
-     + f"<p>Leakage checks: the rolling-form brute-force test found 0 mismatches; adding this race's points gain "
+     + f"<p>Leakage checks: the rolling-form brute-force test found {mismatch} mismatches; adding this race's points gain "
        f"(leaky) moves validation PR-AUC from {leak_table['val PR-AUC'][0]:.3f} to {leak_table['val PR-AUC'][1]:.3f}.</p>",
-     ["features_univariate_auc", "features_binned_rates", "features_correlation", "features_coverage_drift"]),
+     ["features_univariate_auc", "features_binned_rates", "features_correlation", "features_coverage_drift"],
+     box(f"""On the training seasons, the strongest single features are
+{', '.join(f"<code>{r.feature}</code> (AUC {r['single-feature AUC']:.3f})" for _, r in ev_top.iterrows())}.
+{' '.join(f"<code>{k}</code> was dropped: {html.escape(v)}." for k, v in REPORT['dropped_features'].items())}
+Qualifying features are {quali_missing_train:.0f}% missing in the training data (seasons before
+{REPORT['first_quali_year']}), so a missing-indicator is added. The leakage test shows why the cutoff matters: adding
+this race's points would raise validation PR-AUC from {leak_table['val PR-AUC'][0]:.3f} to
+{leak_table['val PR-AUC'][1]:.3f}, an impossible score.""")),
     ("6. Split, pre-processing and experiments", f"""
 Temporal split: train {REPORT['train_from']}–{TRAIN_END} (training window chosen on validation PR-AUC), validation
 {TRAIN_END + 1}–{VAL_END}, test {VAL_END + 1}–{int(df.year.max())}. Pre-processing order experiments (logistic
 regression):<br>{order_exp[['val PR-AUC', 'test PR-AUC']].round(3).to_html()}""",
-     ["split", "preprocessing_effect", "preprocessing_order"]),
+     ["split", "preprocessing_effect", "preprocessing_order"],
+     md_to_html(f"""We split by season (train ≤ {TRAIN_END}, validation {TRAIN_END + 1}–{VAL_END}, test
+{VAL_END + 1}–{int(df.year.max())}) because the task is to predict future races; a random split would mix races of the
+same season and leak era information. The test seasons start a new technical era, so they also test robustness to a
+rule change. The training window {REPORT['train_from']}–{TRAIN_END} gave the best validation PR-AUC of the windows
+tried.
+
+""" + INTERP["preprocessing"])),
     ("7. Models", f"""
 Primary metric PR-AUC (rare positive class, ranking quality), secondary F1 at the validation-chosen threshold.
 Selected model: <b>{BEST_NAME}</b> {html.escape(REPORT['best_params'])}: validation PR-AUC {best_val['PR-AUC']:.3f},
 test PR-AUC {best_test['PR-AUC']:.3f}, test ROC-AUC {best_test['ROC-AUC']:.3f}, test F1 {best_test['F1']:.3f},
 test top-3 hit rate {fmt_pct(best_test['Top-3 hit'])} (grid-rule reference: PR-AUC {grid_test['PR-AUC']:.3f},
 top-3 {fmt_pct(grid_test['Top-3 hit'])}).<br>{comparison_wide.round(3).to_html()}""",
-     ["hyperparameter_trials", "model_comparison", "model_curves", "confusion_and_mlp"]),
+     ["hyperparameter_trials", "model_comparison", "model_curves", "confusion_and_mlp"],
+     md_to_html(INTERP["models"])),
     ("8. Feature-group ablation", f"""
 Largest validation PR-AUC drop when removed: {', '.join(f"{r['removed group']} ({r['Δ val PR-AUC']:+.3f})"
                                                        for _, r in abl_best.head(3).iterrows())}.<br>
 {ablation[['model', 'removed group', 'val PR-AUC', 'Δ val PR-AUC', 'test PR-AUC', 'Δ test PR-AUC']].round(3).to_html(index=False)}""",
-     ["ablation"]),
+     ["ablation"],
+     md_to_html(INTERP["ablation"])),
     ("9. Explainability", f"""
 Permutation importance top-5: {', '.join(REPORT['pi_top'])}. SHAP top-5: {', '.join(REPORT.get('shap_top', ['n/a']))}.
-<b>These are not causal effects</b>: they show what the model relies on, not what makes a driver finish on the podium.
-Correlated features (e.g. grid and qualifying position) share importance, so one can look unimportant while the
-pair is essential.""",
-     [k for k in FIGURES if k.startswith("xai_")]),
+<b>These are not causal effects</b>: they show what the model relies on, not what makes a driver finish on the podium.""",
+     [k for k in FIGURES if k.startswith("xai_")],
+     md_to_html("\n\n".join(INTERP[k] for k in ["permutation", "shap", "local"] if k in INTERP))),
     ("10. Inference", f"""Complete record: {html.escape(str(REPORT['inference_complete']))}<br>
-Partially-missing record: {html.escape(str(REPORT['inference_partial']))}""", []),
-    ("11. Known limitations", """
+Partially-missing record: {html.escape(str(REPORT['inference_partial']))}""", [],
+     box(f"""<code>predict_podium()</code> takes a dictionary of pre-race features. For a complete record it returns a
+podium probability of {REPORT['inference_complete']['podium_probability']:.2f}
+({'above' if REPORT['inference_complete']['predicted_podium'] else 'below'} the {BEST_THR:.2f} threshold). For a record
+with {len(REPORT['inference_partial']['missing_features'])} of {len(FEATURES)} features missing it still works
+(probability {REPORT['inference_partial']['podium_probability']:.2f},
+"{'podium' if REPORT['inference_partial']['predicted_podium'] else 'no podium'}"): missing values are filled with
+training medians plus missing-flags, and unknown keys such as <code>team_principal</code> are reported and
+ignored.""")),
+    ("11. Known limitations", f"""
 <ul><li>Historical qualifying-coverage drift: qualifying features are missing before the mid-1990s; they are imputed
 with an indicator, so the model treats old and modern rows differently.</li>
 <li>Era sensitivity: regulation changes (2014, 2022) reshuffle competitiveness; form features adapt only after a few
@@ -1787,7 +2018,11 @@ races, so early-season predictions after a rule change are weakest.</li>
 <li>Constructor identity breaks at renames; team history resets.</li>
 <li>Independent per-driver predictions ignore that each race has exactly three podium places.</li>
 <li>Sprint results and practice data are not used; weather and safety cars are not in the data.</li>
-<li>Small samples for some circuits and constructors in Q1/Q3 — see the confidence intervals.</li></ul>""", []),
+<li>Small samples for some circuits and constructors in Q1/Q3 — see the confidence intervals.</li>
+<li>The Q3 status mapping is a judgement call: "Retired" ({retired_n} starts) is counted as non-mechanical.</li>
+<li>The validation set is only two seasons ({len(val)} rows), so small differences between models are noise.</li>
+{'<li>The selected model is not reliably better than the logistic-regression baseline (bootstrap CI includes 0).</li>' if same_as_baseline else ''}</ul>""",
+     [], ""),
 ]
 
 
@@ -1798,20 +2033,40 @@ def img_tag(name):
             f'{html.escape(caption)}</figcaption></figure>')
 
 
-body = "".join(f"<h2>{html.escape(t)}</h2><p>{txt}</p>" + "".join(img_tag(n) for n in figs if n in FIGURES)
-               for t, txt, figs in sections)
+logo = (f'<img class="logo" src="data:image/png;base64,{base64.b64encode(LOGO.read_bytes()).decode()}" '
+        f'alt="logo">' if LOGO.exists() else "")
+cover = f"""<div class="cover">{logo}
+<p class="subject">Advanced Computer Lab (ACL)</p>
+<p class="ctitle">Formula 1 Podium Prediction Companion</p>
+<p class="csub">Milestone 1 Report</p>
+<table class="team"><tr><th>Name</th><th>ID</th></tr>
+{''.join(f'<tr><td>{n}</td><td>{i}</td></tr>' for n, i in TEAM)}</table>
+<p class="clinks">Kaggle notebook: {KAGGLE_URL}<br>GitHub repository: {GITHUB_URL}<br>
+Data: Formula 1 World Championship (1950–2024), Kaggle / Ergast</p>
+<p class="cdate">October 2026</p></div>"""
+body = "".join(f"<h2>{html.escape(t)}</h2><p>{txt}</p>" + "".join(img_tag(n) for n in figs if n in FIGURES) + interp
+               for t, txt, figs, interp in sections)
 report_html = f"""<!doctype html><html><head><meta charset="utf-8"><title>F1 Podium Prediction — Milestone 1</title>
 <style>body{{font-family:Georgia,serif;max-width:1000px;margin:auto;padding:24px;line-height:1.45}}
-table{{border-collapse:collapse;font-size:12px}}td,th{{border:1px solid #ccc;padding:3px 6px}}
+table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:3px 6px;font-size:11px}}
 figcaption{{font-size:12px;color:#555}}h2{{border-bottom:2px solid #e63946;padding-bottom:4px;margin-top:36px}}
-@media print{{figure{{page-break-inside:avoid}}}}</style></head><body>
-<h1>Formula 1 Podium Prediction — Milestone 1 Report</h1>
+.interp{{background:#f6f7f9;border-left:4px solid #e63946;padding:8px 14px;margin:16px 0}}.interp p{{margin:6px 0}}
+.interp ul{{margin:4px 0 4px 18px;padding:0}}
+.lbl{{font-weight:bold;color:#e63946;margin:0 0 4px 0;font-size:13px;text-transform:uppercase}}
+.cover{{text-align:center;padding-top:70mm;page-break-after:always;break-after:page}}
+.cover .logo{{width:240px;margin:0 auto 48px auto}}.subject{{font-size:20px;letter-spacing:1px;color:#444;margin:0 0 28px 0}}
+.ctitle{{font-size:34px;font-weight:bold;margin:0 0 8px 0;line-height:1.2}}.csub{{font-size:22px;color:#e63946;margin:0 0 56px 0}}
+.team{{margin:0 auto 48px auto}}.team td,.team th{{font-size:16px;padding:8px 28px;text-align:left}}.team th{{background:#f6f7f9}}
+.clinks{{font-size:12px;color:#555;line-height:1.7}}.cdate{{font-size:14px;color:#444;margin-top:24px}}
+@page{{size:A4;margin:14mm}}
+@media print{{figure,.interp{{page-break-inside:avoid}}h2{{page-break-after:avoid}}}}</style></head><body>
+{cover}<h1>Formula 1 Podium Prediction — Milestone 1 Report</h1>
 <p>ACL · predicting whether a driver finishes in the top 3 using only information available after qualifying and
 before the race.</p>{body}</body></html>"""
 (REPORT_DIR / "report.html").write_text(report_html, encoding="utf-8")
 md = "# Formula 1 Podium Prediction — Milestone 1 Report\n\n" + "\n\n".join(
-    f"## {t}\n\n{re.sub(r'<[^>]+>', ' ', txt).strip()}\n\n" + "\n".join(
-        f"![{FIGURES[n][1]}](../figures/{n}.png)" for n in figs if n in FIGURES) for t, txt, figs in sections)
+    f"## {t}\n\n{re.sub(r'<[^>]+>', ' ', txt + interp).strip()}\n\n" + "\n".join(
+        f"![{FIGURES[n][1]}](../figures/{n}.png)" for n in figs if n in FIGURES) for t, txt, figs, interp in sections)
 (REPORT_DIR / "report.md").write_text(md, encoding="utf-8")
 print("Report written to", (REPORT_DIR / "report.html").resolve())
 print(f"{len(FIGURES)} figures in {FIG_DIR.resolve()}, tables in {TAB_DIR.resolve()}")
