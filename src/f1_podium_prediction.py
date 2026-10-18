@@ -1390,37 +1390,76 @@ for name, b in best.items():
                      "threshold": thr})
 comparison = pd.DataFrame(rows)
 savetable(comparison, "model_comparison")
-BEST_NAME = max(best, key=lambda n: best[n]["val PR-AUC"])
-BEST_MODEL, BEST_THR = best[BEST_NAME]["model_obj"], THRESHOLDS[BEST_NAME]
-REPORT["best_model"] = BEST_NAME
-REPORT["best_params"] = best[BEST_NAME]["params"]
-print(f"Selected model (highest validation PR-AUC): {BEST_NAME} {best[BEST_NAME]['params']}, threshold {BEST_THR:.3f}")
+TOP_NAME = max(best, key=lambda n: best[n]["val PR-AUC"])
+print(f"Highest validation PR-AUC: {TOP_NAME} {best[TOP_NAME]['params']}")
 comparison_wide = comparison.pivot(index="model", columns="split",
                                    values=["PR-AUC", "ROC-AUC", "F1", "Precision", "Recall", "Top-3 hit"])
 comparison_wide = comparison_wide.reindex(columns=["train", "validation", "test"], level=1)
 comparison_wide.round(3)
 
 # %% [markdown]
-# **Is the gap between the selected model and the baseline real?** The validation set is small (two seasons), so we
-# resample its *races* with replacement 1,000 times (a bootstrap; whole races are kept together because the drivers
-# of one race are not independent) and recompute the PR-AUC difference each time. If the 95% interval of the
-# difference contains 0, the two models cannot be told apart on this data.
+# ### 8.4 Model selection: is any model really better than the baseline?
+# The validation set is small (two seasons), so a difference of a few thousandths in PR-AUC can be luck. We resample
+# the validation *races* with replacement 1,000 times (a bootstrap; whole races are kept together because the drivers
+# of one race are not independent) and recompute, for every model, its PR-AUC difference to the baseline on the same
+# resampled races. If the 95% interval contains 0, the model cannot be told apart from the baseline on this data.
+#
+# We compare two selection rules (both use validation data only):
+# * **Rule A — highest validation PR-AUC.** Simple, but with tied models the winner can flip after tiny changes.
+# * **Rule B — the baseline must be beaten reliably.** Keep the logistic-regression baseline unless another model's
+#   95% interval lies *entirely above 0*; if several do, take the one with the highest validation PR-AUC. This is the
+#   brief's idea of a baseline: a more complex model has to *earn* its extra complexity. **We use Rule B.**
 
 # %%
 BASELINE_NAME = "Logistic regression (baseline)"
 rng_boot = np.random.default_rng(SEED)
 val_rows_by_race = [np.flatnonzero(val.raceId.to_numpy() == r) for r in val.raceId.unique()]
-p_sel, p_base = probs[(BEST_NAME, "validation")], probs[(BASELINE_NAME, "validation")]
-boot_diff = []
-for _ in range(1000):
-    pick = rng_boot.integers(0, len(val_rows_by_race), len(val_rows_by_race))
-    idx = np.concatenate([val_rows_by_race[i] for i in pick])
-    boot_diff.append(average_precision_score(yva[idx], p_sel[idx]) - average_precision_score(yva[idx], p_base[idx]))
-boot_ci = np.percentile(boot_diff, [2.5, 97.5])
-REPORT["boot_diff"] = float(average_precision_score(yva, p_sel) - average_precision_score(yva, p_base))
-REPORT["boot_ci"] = boot_ci.tolist()
-print(f"Validation PR-AUC difference, {BEST_NAME} − baseline: {REPORT['boot_diff']:+.3f} "
-      f"(95% bootstrap CI {boot_ci[0]:+.3f} to {boot_ci[1]:+.3f}, {len(val_rows_by_race)} races)")
+boot_samples = [np.concatenate([val_rows_by_race[i] for i in rng_boot.integers(0, len(val_rows_by_race),
+                                                                             len(val_rows_by_race))])
+                for _ in range(1000)]
+def score(model, split, metric):
+    return comparison[(comparison.model == model) & (comparison.split == split)][metric].iloc[0]
+
+
+p_base = probs[(BASELINE_NAME, "validation")]
+boot_rows = []
+for name in best:
+    if name == BASELINE_NAME:
+        continue
+    p_m = probs[(name, "validation")]
+    diffs = [average_precision_score(yva[i], p_m[i]) - average_precision_score(yva[i], p_base[i]) for i in boot_samples]
+    lo, hi = np.percentile(diffs, [2.5, 97.5])
+    boot_rows.append({"model": name, "val PR-AUC": score(name, "validation", "PR-AUC"),
+                      "Δ vs baseline": score(name, "validation", "PR-AUC") - score(BASELINE_NAME, "validation", "PR-AUC"),
+                      "CI low": lo, "CI high": hi, "reliably better": lo > 0})
+boot_table = pd.DataFrame(boot_rows).sort_values("val PR-AUC", ascending=False).set_index("model")
+savetable(boot_table, "bootstrap_vs_baseline")
+
+# Rule A and Rule B, both decided on validation only
+RULE_A = TOP_NAME
+winners = boot_table[boot_table["reliably better"]]
+RULE_B = winners["val PR-AUC"].idxmax() if len(winners) else BASELINE_NAME
+BEST_NAME = RULE_B
+BEST_MODEL, BEST_THR = best[BEST_NAME]["model_obj"], THRESHOLDS[BEST_NAME]
+
+if TOP_NAME == BASELINE_NAME:
+    top_diff, top_ci = 0.0, [0.0, 0.0]
+else:
+    top_diff = float(boot_table.loc[TOP_NAME, "Δ vs baseline"])
+    top_ci = boot_table.loc[TOP_NAME, ["CI low", "CI high"]].tolist()
+REPORT.update(best_model=BEST_NAME, best_params=best[BEST_NAME]["params"], rule_a=RULE_A, rule_b=RULE_B,
+              boot_diff=top_diff, boot_ci=top_ci)
+
+rule_rows = []
+for rule, m in [("A: highest validation PR-AUC", RULE_A), ("B: baseline unless reliably beaten", RULE_B)]:
+    rule_rows.append({"rule": rule, "selected model": m, "val PR-AUC": score(m, "validation", "PR-AUC"),
+                      "val F1": score(m, "validation", "F1"), "test PR-AUC": score(m, "test", "PR-AUC"),
+                      "test F1": score(m, "test", "F1")})
+rule_cmp = pd.DataFrame(rule_rows).set_index("rule")
+savetable(rule_cmp, "selection_rules")
+print(f"Selected model (Rule B): {BEST_NAME} {best[BEST_NAME]['params']}, threshold {BEST_THR:.3f}")
+display(boot_table.round(3))
+rule_cmp.round(3)
 
 # %%
 fig, axes = plt.subplots(2, 2, figsize=(15, 11))
@@ -1470,29 +1509,28 @@ fig.tight_layout()
 savefig(fig, "confusion_and_mlp", "Confusion matrices on the test seasons and the MLP training curve.")
 
 # %%
-def score(model, split, metric):
-    return comparison[(comparison.model == model) & (comparison.split == split)][metric].iloc[0]
-
-
 val_pr = {m: score(m, "validation", "PR-AUC") for m in best}
 models_by_val = sorted(val_pr, key=val_pr.get, reverse=True)
+fmt_metric = lambda k, v: f"{v:.1%}" if k == "Top-3 hit" else f"{v:.3f}"
 grid_t = lambda metric: score("Grid rule (reference)", "test", metric)
 sel_t = lambda metric: score(BEST_NAME, "test", metric)
-same_as_baseline = BEST_NAME == BASELINE_NAME or REPORT["boot_ci"][0] <= 0 <= REPORT["boot_ci"][1]
+same_as_baseline = not boot_table["reliably better"].any()
 mlp_trials = trials[trials.model == "Shallow NN (MLP)"].assign(two_layers=lambda t: t.params.str.contains(r"\(\d+, \d+\)"))
 mlp_1, mlp_2 = (mlp_trials.loc[mlp_trials.two_layers == k, "val PR-AUC"].max() for k in (False, True))
 worst = models_by_val[-1]
 thr_lo, thr_hi = min(THRESHOLDS.values()), max(THRESHOLDS.values())
+boot_txt = "; ".join(f"{m} {r['Δ vs baseline']:+.3f} (95% CI {r['CI low']:+.3f} to {r['CI high']:+.3f})"
+                     for m, r in boot_table.iterrows())
 INTERP["models"] = f"""**Model choice vs the baseline.**
 
-- Validation PR-AUC (primary metric): {', '.join(f'{m} {val_pr[m]:.3f}' for m in models_by_val)}. Our rule selects
-  the model with the highest validation PR-AUC: **{BEST_NAME}** {best[BEST_NAME]['params']}, threshold {BEST_THR:.3f}.
-- Against the "first three on the grid" rule on test: {'; '.join(f"{k} {sel_t(k):.3f} vs {grid_t(k):.3f} ({'better' if sel_t(k) > grid_t(k) else 'worse'})" for k in ['PR-AUC', 'F1', 'Top-3 hit'])}.
-  {'The model ranks drivers better overall (PR-AUC), even where it does not beat the grid rule on every metric.' if sel_t('PR-AUC') > grid_t('PR-AUC') else ''}
-- Against the logistic-regression baseline (validation {score(BASELINE_NAME, 'validation', 'PR-AUC'):.3f}, test
-  {score(BASELINE_NAME, 'test', 'PR-AUC'):.3f}): the race-level bootstrap gives a validation PR-AUC difference of
-  {REPORT['boot_diff']:+.3f} (95% CI {REPORT['boot_ci'][0]:+.3f} to {REPORT['boot_ci'][1]:+.3f}).
-  {'**The interval contains 0, so the two models cannot be told apart:** most of the signal is captured by a simple linear model on good pre-race features, and the extra complexity adds little.' if same_as_baseline else '**The interval excludes 0, so the selected model is reliably better than the baseline.**'}
+- Validation PR-AUC (primary metric): {', '.join(f'{m} {val_pr[m]:.3f}' for m in models_by_val)}.
+- Race-level bootstrap, difference to the baseline on validation: {boot_txt}.
+  {'**No model is reliably better than the baseline** (every interval contains 0): the differences between the top models are within luck.' if same_as_baseline else '**At least one model is reliably better than the baseline** (its interval lies above 0).'}
+- **Selection.** Rule A (highest validation PR-AUC) would pick **{RULE_A}**; Rule B (keep the baseline unless it is
+  reliably beaten) picks **{RULE_B}**. We use Rule B, so the selected model is **{BEST_NAME}** {best[BEST_NAME]['params']},
+  threshold {BEST_THR:.3f}. {'The two rules agree.' if RULE_A == RULE_B else 'Rule B gives the simpler, more stable and more interpretable model at no reliable loss in validation PR-AUC; with Rule A the winner changes after tiny changes (library version, one bad data value), because the top models are tied.'}
+  The test scores of both choices are shown only for information; they were not used to choose.
+- Against the "first three on the grid" rule on test: {'; '.join(f"{k} {fmt_metric(k, sel_t(k))} vs {fmt_metric(k, grid_t(k))} ({'better' if sel_t(k) > grid_t(k) else 'worse'})" for k in ['PR-AUC', 'F1', 'Top-3 hit'])}.
 - Shallow network depth: best one-layer version {mlp_1:.3f}, best two-layer version {mlp_2:.3f} on validation, so
   {'more depth did not help' if mlp_2 <= mlp_1 else 'the second layer helped a little'}.
 - The weakest model on validation is {worst} ({val_pr[worst]:.3f}).
@@ -1524,12 +1562,12 @@ display(Markdown(INTERP["models"]))
 
 # %% [markdown]
 # ## 9. Feature-group ablation
-# Remove one group at a time, re-train the selected model type with its chosen hyperparameters (and the baseline),
-# re-tune the threshold on validation, and measure the change.
+# Remove one group at a time, re-train the selected model (and the baseline and the highest-validation model) with
+# its chosen hyperparameters, re-tune the threshold on validation, and measure the change.
 
 # %%
 abl_rows = []
-for model_name in dict.fromkeys([BEST_NAME, "Logistic regression (baseline)"]):
+for model_name in dict.fromkeys([BEST_NAME, BASELINE_NAME, TOP_NAME]):
     factory = CANDIDATES[model_name][0]
     params = best[model_name]["params_dict"]
     for removed in [None] + list(GROUPS):
@@ -1694,7 +1732,7 @@ for label, i in local_cases.items():
     print(f"{label}: {rw.forename} {rw.surname}, {rw.year} {rw['name']} — p(podium)={rw.p:.2f}, "
           f"actual podium={bool(rw.podium)}, grid={rw.grid_pos:.0f}")
 
-local_shap, lime_lists = {}, {}
+local_shap = {}
 if shap_values is not None:
     for label, i in local_cases.items():
         x_row = Xte.iloc[[i]] if isinstance(BEST_MODEL, HistGradientBoostingClassifier) \
@@ -1713,28 +1751,56 @@ def lime_predict(X):
     return np.column_stack([1 - p, p])
 
 
+# LIME is tried in two settings and compared with local SHAP:
+#  * default: every feature is treated as continuous, so a 0/1 flag is perturbed like a number;
+#  * flags as categorical: 0/1 features (found from the data) are sampled from their real training frequencies.
+BINARY_FEATURES = [f for f in FEATURES if set(Xtr[f].dropna().unique()) <= {0, 1}]
+print("0/1 features treated as categorical in LIME:", BINARY_FEATURES)
+
+
+def lime_feature(condition):
+    """'grid_pos <= 3.00' or 'front_row=1' -> feature name (longest name first, so similar names are not confused)."""
+    return next(f for f in sorted(FEATURES, key=len, reverse=True) if f in condition)
+
+
+lime_lists, lime_cmp_rows = {}, []
 if HAS_LIME:
     med = Xtr.median()
-    lime_exp = LimeTabularExplainer(Xtr.fillna(med).to_numpy(), feature_names=FEATURES,
-                                    class_names=["no podium", "podium"], mode="classification",
-                                    discretize_continuous=True, random_state=SEED)
-    for label, i in local_cases.items():
-        exp = lime_exp.explain_instance(Xte.iloc[i].fillna(med).to_numpy(), lime_predict, num_features=10)
-        lime_lists[label] = exp.as_list()
-        fig = exp.as_pyplot_figure()
-        fig.set_size_inches(9, 5)
-        plt.title(f"LIME — {label} (p={p_test[i]:.2f})")
-        savefig(fig, f"xai_lime_{label.replace(' ', '_')}", f"LIME explanation for one {label} prediction.")
+    lime_variants = {
+        "default": LimeTabularExplainer(Xtr.fillna(med).to_numpy(), feature_names=FEATURES,
+                                        class_names=["no podium", "podium"], mode="classification",
+                                        discretize_continuous=True, random_state=SEED),
+        "flags as categorical": LimeTabularExplainer(Xtr.fillna(med).to_numpy(), feature_names=FEATURES,
+                                                     class_names=["no podium", "podium"], mode="classification",
+                                                     categorical_features=[FEATURES.index(f) for f in BINARY_FEATURES],
+                                                     discretize_continuous=True, random_state=SEED),
+    }
+    for variant, explainer_lime in lime_variants.items():
+        for label, i in local_cases.items():
+            exp = explainer_lime.explain_instance(Xte.iloc[i].fillna(med).to_numpy(), lime_predict, num_features=10)
+            lime_order = [lime_feature(c) for c, _ in exp.as_list()]
+            shap_order = list(local_shap[label].abs().sort_values(ascending=False).index) if label in local_shap else []
+            top3, shap_top3 = lime_order[:3], shap_order[:3]
+            top3_nf = [f for f in lime_order if f not in BINARY_FEATURES][:3]
+            shap_top3_nf = [f for f in shap_order if f not in BINARY_FEATURES][:3]
+            lime_cmp_rows.append({"LIME setting": variant, "case": label, "LIME top 3": ", ".join(top3),
+                                  "SHAP top 3": ", ".join(shap_top3),
+                                  "shared with SHAP (of 3)": len(set(top3) & set(shap_top3)),
+                                  "shared, 0/1 flags left out (of 3)": len(set(top3_nf) & set(shap_top3_nf))})
+            if variant == "flags as categorical":
+                lime_lists[label] = exp.as_list()
+                fig = exp.as_pyplot_figure()
+                fig.set_size_inches(9, 5)
+                plt.title(f"LIME (0/1 flags categorical) — {label} (p={p_test[i]:.2f})")
+                savefig(fig, f"xai_lime_{label.replace(' ', '_')}", f"LIME explanation for one {label} prediction "
+                        "(0/1 flags treated as categorical).")
+    lime_cmp = savetable(pd.DataFrame(lime_cmp_rows), "lime_settings_comparison")
+    display(lime_cmp)
 else:
     print("LIME is not installed — local explanation shown with SHAP only (`pip install lime` to add it).")
 
 # %%
-def lime_feature(condition):
-    """'grid_pos <= 3.00' -> 'grid_pos' (longest name first, so similar names are not confused)."""
-    return next(f for f in sorted(FEATURES, key=len, reverse=True) if f in condition)
-
-
-lines, shared_counts = [], []
+lines = []
 for label, i in local_cases.items():
     rw = tst_view.loc[i]
     txt = (f"**{label}** — {rw.forename} {rw.surname}, {rw.year} {rw['name']}, grid {rw.grid_pos:.0f}, "
@@ -1748,12 +1814,37 @@ for label, i in local_cases.items():
     if len(shap_top) and lime_top:
         txt += f" Shared by both methods: {len(set(shap_top) & set(lime_top))} of 3."
     lines.append(txt)
-    shared_counts.append(len(set(shap_top) & set(lime_top)) if len(shap_top) and lime_top else 3)
-if min(shared_counts) < 2:
-    lines.append("LIME and local SHAP agree only partly. LIME perturbs every feature independently over its whole "
-                 "training range, so rare 0/1 flags (e.g. `pit_lane_start`, `first_round`) get large, unrealistic "
-                 "changes and look important; SHAP compares the row with realistic background rows. We therefore "
-                 "trust SHAP more and read LIME as a rough check.")
+if lime_cmp_rows:
+    lc = pd.DataFrame(lime_cmp_rows).groupby("LIME setting")
+    agree, agree_nf = lc["shared with SHAP (of 3)"].mean(), lc["shared, 0/1 flags left out (of 3)"].mean()
+    flags_in_lime = sorted({f for r in lime_cmp_rows for f in r["LIME top 3"].split(", ") if f in BINARY_FEATURES})
+    better = agree["flags as categorical"] > agree["default"]
+    nf_sets = []
+    for label in local_cases:
+        nf_sets.append(set([lime_feature(c) for c, _ in lime_lists[label] if lime_feature(c) not in BINARY_FEATURES][:3])
+                       & set([f for f in local_shap[label].abs().sort_values(ascending=False).index
+                              if f not in BINARY_FEATURES][:3]))
+    shared_nf = sorted(set.union(*nf_sets)) if nf_sets else []
+    lines.append(f"**LIME settings compared.** Top-3 features shared with local SHAP (average of the two cases): "
+                 f"default LIME {agree['default']:.1f} of 3, LIME with the 0/1 flags treated as categorical "
+                 f"{agree['flags as categorical']:.1f} of 3. "
+                 + ("Treating the flags as categorical improved the agreement. " if better else
+                    "Treating the flags as categorical did not change the agreement, so the difference is not a "
+                    "setting problem. ")
+                 + "We still plot the categorical setting, because it only creates realistic rows (a flag is 0 or 1, "
+                 "never 0.4).")
+    if flags_in_lime:
+        lines.append(f"**Why the two methods disagree.** LIME ranks the 0/1 flags {', '.join(f'`{f}`' for f in flags_in_lime)} "
+                     "high, SHAP does not. They answer different questions. LIME asks *what would change if this "
+                     "feature had a different value?* For a pole-sitter, switching to a pit-lane start would change "
+                     "the prediction a lot, so the flag looks important. SHAP asks *how much does this driver's actual "
+                     "value differ from a typical driver's?* Almost every driver has these flags at 0, like this one, "
+                     "so SHAP gives them about 0. Leaving the 0/1 flags out, LIME and SHAP share "
+                     f"{agree_nf['flags as categorical']:.1f} of their top 3 features (categorical setting)"
+                     + (f", so they agree on what drives these predictions: {', '.join(f'`{f}`' for f in shared_nf)}."
+                        if agree_nf["flags as categorical"] >= 2 else
+                        "; they still differ, so for single predictions we rely mainly on SHAP, which is consistent "
+                        "with the global explanations."))
 INTERP["local"] = ("**Local explanations — interpretation.**\n\n- " + "\n- ".join(lines)
                    + "\n- The false alarm is a driver the model had every pre-race reason to rate highly. The model "
                      "only sees pre-race information, so it cannot foresee a retirement or incident during the race; "
@@ -1986,7 +2077,7 @@ Primary metric PR-AUC (rare positive class, ranking quality), secondary F1 at th
 Selected model: <b>{BEST_NAME}</b> {html.escape(REPORT['best_params'])}: validation PR-AUC {best_val['PR-AUC']:.3f},
 test PR-AUC {best_test['PR-AUC']:.3f}, test ROC-AUC {best_test['ROC-AUC']:.3f}, test F1 {best_test['F1']:.3f},
 test top-3 hit rate {fmt_pct(best_test['Top-3 hit'])} (grid-rule reference: PR-AUC {grid_test['PR-AUC']:.3f},
-top-3 {fmt_pct(grid_test['Top-3 hit'])}).<br>{comparison_wide.round(3).to_html()}""",
+top-3 {fmt_pct(grid_test['Top-3 hit'])}).<br>{comparison_wide.round(3).to_html()}<br>Bootstrap against the baseline (validation):<br>{boot_table.round(3).to_html()}<br>Selection rules:<br>{rule_cmp.round(3).to_html()}""",
      ["hyperparameter_trials", "model_comparison", "model_curves", "confusion_and_mlp"],
      md_to_html(INTERP["models"])),
     ("8. Feature-group ablation", f"""
@@ -1997,7 +2088,8 @@ Largest validation PR-AUC drop when removed: {', '.join(f"{r['removed group']} (
      md_to_html(INTERP["ablation"])),
     ("9. Explainability", f"""
 Permutation importance top-5: {', '.join(REPORT['pi_top'])}. SHAP top-5: {', '.join(REPORT.get('shap_top', ['n/a']))}.
-<b>These are not causal effects</b>: they show what the model relies on, not what makes a driver finish on the podium.""",
+<b>These are not causal effects</b>: they show what the model relies on, not what makes a driver finish on the podium.
+{('<br>LIME settings compared with local SHAP:<br>' + lime_cmp.to_html(index=False)) if lime_cmp_rows else ''}""",
      [k for k in FIGURES if k.startswith("xai_")],
      md_to_html("\n\n".join(INTERP[k] for k in ["permutation", "shap", "local"] if k in INTERP))),
     ("10. Inference", f"""Complete record: {html.escape(str(REPORT['inference_complete']))}<br>
@@ -2021,7 +2113,7 @@ races, so early-season predictions after a rule change are weakest.</li>
 <li>Small samples for some circuits and constructors in Q1/Q3 — see the confidence intervals.</li>
 <li>The Q3 status mapping is a judgement call: "Retired" ({retired_n} starts) is counted as non-mechanical.</li>
 <li>The validation set is only two seasons ({len(val)} rows), so small differences between models are noise.</li>
-{'<li>The selected model is not reliably better than the logistic-regression baseline (bootstrap CI includes 0).</li>' if same_as_baseline else ''}</ul>""",
+{'<li>No model is reliably better than the logistic-regression baseline (every bootstrap interval includes 0), so the simplest model is used; more data or new features would be needed to justify a more complex model.</li>' if same_as_baseline else ''}</ul>""",
      [], ""),
 ]
 

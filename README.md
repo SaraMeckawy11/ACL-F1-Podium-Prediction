@@ -55,7 +55,11 @@ The fake data is random: its numbers mean nothing and must never be reported.
   deliberately leaky model demonstrate both.
 - **Split**: temporal — train ≤ 2019, validation 2020–2021, test 2022–2024; training window chosen on validation.
 - **Models**: grid-rule reference, logistic regression (baseline), random forest, histogram gradient boosting,
-  shallow MLP; primary metric PR-AUC, secondary F1 at a validation-chosen threshold; a race-level bootstrap checks
-  whether the selected model is really better than the baseline.
+  shallow MLP; primary metric PR-AUC, secondary F1 at a validation-chosen threshold.
+- **Model selection**: a race-level bootstrap compares every model with the logistic-regression baseline on
+  validation; the baseline is kept unless another model is reliably better (95% interval above 0). The simpler
+  "highest validation PR-AUC" rule is shown next to it for comparison.
+- **LIME**: run with default settings and with the 0/1 flags treated as categorical; the categorical setting is
+  used because it only creates realistic rows. Both are compared with local SHAP.
 - **Statistics**: Q2 uses the Mantel–Haenszel pooled odds ratio (`statsmodels` `StratifiedTable`), Q3 Wilson
   intervals (`statsmodels` `proportion_confint`).
