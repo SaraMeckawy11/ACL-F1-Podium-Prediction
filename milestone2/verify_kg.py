@@ -10,7 +10,7 @@ import sys
 from neo4j import GraphDatabase
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from Create_kg import find_file, read_config  # noqa: E402
+from Create_kg import read_config  # noqa: E402
 
 EXPECTED_NODES, EXPECTED_RELS = 51113, 163510
 
@@ -22,7 +22,7 @@ def load_queries(path):
 
 
 def main():
-    cfg = read_config(find_file("config.txt"))
+    cfg = read_config()
     driver = GraphDatabase.driver(cfg["URI"], auth=(cfg["USERNAME"], cfg["PASSWORD"]))
     with driver.session() as s:
         n = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
